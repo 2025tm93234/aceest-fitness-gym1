@@ -1,53 +1,33 @@
-"""
-ACEest Fitness & Gym - Flask Application
-
-Independent Flask implementation for the ACEest Fitness & Gym assignment.
-The supplied Tkinter versions are used as functional references; the Flask
-application is built incrementally and kept testable and containerizable.
-"""
-
+import csv
+import io
 import os
-import random
 import sqlite3
-from datetime import date
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timezone
+from functools import wraps
 from typing import Optional
 
-from flask import Flask, g, jsonify, request
-
+from flask import Flask, g, jsonify, make_response, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 DB_PATH = os.environ.get("DB_PATH", "aceest_fitness.db")
 
-
 PROGRAM_TEMPLATES = {
-    "Fat Loss": [
-        "Full Body HIIT",
-        "Circuit Training",
-        "Cardio + Weights",
-    ],
-    "Muscle Gain": [
-        "Push/Pull/Legs",
-        "Upper/Lower Split",
-        "Full Body Strength",
-    ],
-    "Beginner": [
-        "Full Body 3x/week",
-        "Light Strength + Mobility",
-    ],
+    "Fat Loss": ["Full Body HIIT", "Circuit Training", "Cardio + Weights"],
+    "Muscle Gain": ["Push/Pull/Legs", "Upper/Lower Split", "Full Body Strength"],
+    "Beginner": ["Full Body 3x/week", "Light Strength + Mobility"],
 }
 
 
 def calculate_bmi(weight_kg: float, height_m: float) -> float:
-    """Calculate BMI from weight in kilograms and height in metres."""
-    if height_m <= 0:
-        raise ValueError("height_m must be > 0")
-    if weight_kg <= 0:
-        raise ValueError("weight_kg must be > 0")
-
+    if weight_kg <= 0 or height_m <= 0:
+        raise ValueError("weight_kg and height_m must be > 0")
     return round(weight_kg / (height_m ** 2), 2)
 
 
 def bmi_category(bmi: float) -> str:
-    """Return a simple BMI category."""
     if bmi < 18.5:
         return "Underweight"
     if bmi < 25:
@@ -57,10 +37,66 @@ def bmi_category(bmi: float) -> str:
     return "Obese"
 
 
+def calculate_daily_calories(weight_kg: float, height_cm: float, age: int, gender: str, activity: str) -> int:
+    if weight_kg <= 0 or height_cm <= 0 or age <= 0:
+        raise ValueError("weight, height and age must be positive")
+    gender = gender.lower()
+    if gender not in {"male", "female"}:
+        raise ValueError("gender must be male or female")
+    factors = {"sedentary": 1.2, "light": 1.375, "moderate": 1.55, "active": 1.725}
+    if activity not in factors:
+        raise ValueError("activity must be sedentary, light, moderate or active")
+    bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * age) + (5 if gender == "male" else -161)
+    return int(round(bmr * factors[activity]))
+
+
+def now_text() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def svg_progress_chart(rows):
+    width, height = 700, 360
+    margin = 50
+    values = [float(r["weight_kg"]) for r in rows if r["weight_kg"] is not None]
+    labels = [str(r["recorded_at"])[:10] for r in rows if r["weight_kg"] is not None]
+    root = ET.Element("svg", width=str(width), height=str(height), xmlns="http://www.w3.org/2000/svg")
+    ET.SubElement(root, "rect", x="0", y="0", width=str(width), height=str(height), fill="white")
+    ET.SubElement(root, "text", x="30", y="25").text = "ACEest Progress Chart - Weight (kg)"
+    if not values:
+        ET.SubElement(root, "text", x="50", y="180").text = "No progress data"
+        return ET.tostring(root, encoding="unicode")
+    ymin, ymax = min(values), max(values)
+    if ymin == ymax:
+        ymin -= 1
+        ymax += 1
+    plot_w = width - 2 * margin
+    plot_h = height - 2 * margin
+    points = []
+    for i, value in enumerate(values):
+        x = margin if len(values) == 1 else margin + (plot_w * i / (len(values) - 1))
+        y = margin + plot_h * (ymax - value) / (ymax - ymin)
+        points.append((x, y))
+    ET.SubElement(
+        root, "line", x1=str(margin), y1=str(height - margin),
+        x2=str(width - margin), y2=str(height - margin), stroke="black"
+    )
+    ET.SubElement(root, "line", x1=str(margin), y1=str(margin), x2=str(margin), y2=str(height-margin), stroke="black")
+    ET.SubElement(
+        root, "polyline",
+        points=" ".join(f"{x:.1f},{y:.1f}" for x, y in points),
+        fill="none", stroke="blue", **{"stroke-width": "2"}
+    )
+    for (x, y), label, value in zip(points, labels, values):
+        ET.SubElement(root, "circle", cx=f"{x:.1f}", cy=f"{y:.1f}", r="4", fill="blue")
+        ET.SubElement(root, "text", x=f"{x:.1f}", y=f"{y-8:.1f}", **{"text-anchor": "middle"}).text = str(value)
+        ET.SubElement(root, "text", x=f"{x:.1f}", y=str(height-20), **{"text-anchor": "middle"}).text = label
+    return ET.tostring(root, encoding="unicode")
+
+
 def create_app(db_path: Optional[str] = None) -> Flask:
-    """Create and configure the Flask application."""
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path or DB_PATH
+    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-change-this-key")
 
     def get_db():
         if "db" not in g:
@@ -75,273 +111,552 @@ def create_app(db_path: Optional[str] = None) -> Flask:
             db.close()
 
     def init_db():
-        conn = sqlite3.connect(app.config["DB_PATH"])
-        cur = conn.cursor()
-
-        cur.execute(
+        db = sqlite3.connect(app.config["DB_PATH"])
+        db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS clients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
                 age INTEGER,
-                height REAL,
-                weight REAL,
-                program TEXT,
-                membership_status TEXT DEFAULT 'Active'
-            )
-            """
-        )
-
-        cur.execute(
-            """
+                gender TEXT,
+                height_cm REAL,
+                weight_kg REAL,
+                goal TEXT,
+                membership_status TEXT DEFAULT 'Active',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS programs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL,
+                program_type TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS exercises (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                muscle_group TEXT,
+                equipment TEXT
+            );
             CREATE TABLE IF NOT EXISTS workouts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 client_name TEXT NOT NULL,
+                exercise_name TEXT NOT NULL,
                 date TEXT NOT NULL,
-                workout_type TEXT,
-                duration_min INTEGER,
-                notes TEXT
-            )
+                duration_min INTEGER DEFAULT 30,
+                calories_burned INTEGER DEFAULT 0,
+                notes TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                weight_kg REAL,
+                body_fat_pct REAL,
+                chest_cm REAL,
+                waist_cm REAL,
+                hip_cm REAL,
+                notes TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL,
+                goal_type TEXT NOT NULL,
+                target_value REAL,
+                target_date TEXT,
+                status TEXT DEFAULT 'Active'
+            );
+            CREATE TABLE IF NOT EXISTS progress (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                weight_kg REAL,
+                note TEXT DEFAULT ''
+            );
             """
         )
+        defaults = [
+            ("admin", generate_password_hash("admin123"), "admin"),
+            ("trainer", generate_password_hash("trainer123"), "trainer"),
+        ]
+        for username, password_hash, role in defaults:
+            db.execute(
+                "INSERT OR IGNORE INTO users (username, password_hash, role) "
+                "VALUES (?, ?, ?)",
+                (username, password_hash, role),
+            )
+        db.commit()
+        db.close()
 
-        conn.commit()
-        conn.close()
+    def error(message, status):
+        return jsonify(error=message), status
 
-    app.init_db = init_db
-    app.get_db = get_db
-    app.calculate_bmi = calculate_bmi
-    app.bmi_category = bmi_category
+    def require_role(*roles):
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                if session.get("role") not in roles:
+                    return error("login with an allowed role is required", 403)
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
 
-    @app.route("/")
+    def client_exists(db, name):
+        return db.execute("SELECT name FROM clients WHERE name = ?", (name,)).fetchone() is not None
+
+    @app.get("/")
     def home():
-        return jsonify(
-            service="ACEest Fitness & Gym API",
-            status="running",
-        )
+        return jsonify(service="ACEest Fitness & Gym API", status="running", version="1.0")
 
-    @app.route("/health")
+    @app.get("/health")
     def health():
         return jsonify(status="ok"), 200
 
-    @app.route("/clients", methods=["POST"])
-    def add_client():
-        data = request.get_json(force=True) or {}
-        name = data.get("name")
-
-        if not name:
-            return jsonify(error="name is required"), 400
-
+    @app.post("/login")
+    def login():
+        data = request.get_json(silent=True) or {}
+        username, password = data.get("username"), data.get("password")
+        if not username or not password:
+            return error("username and password are required", 400)
         db = get_db()
+        row = db.execute("SELECT username, password_hash, role FROM users WHERE username = ?", (username,)).fetchone()
+        if row is None or not check_password_hash(row["password_hash"], password):
+            return error("invalid credentials", 401)
+        session.clear()
+        session["username"] = row["username"]
+        session["role"] = row["role"]
+        return jsonify(username=row["username"], role=row["role"], message="login successful"), 200
 
+    @app.post("/logout")
+    def logout():
+        session.clear()
+        return jsonify(message="logout successful"), 200
+
+    @app.post("/clients")
+    def add_client():
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        if not name:
+            return error("name is required", 400)
+        db = get_db()
         try:
             db.execute(
-                """
-                INSERT INTO clients
-                    (name, age, height, weight, membership_status)
-                VALUES (?, ?, ?, ?, 'Active')
-                """,
+                "INSERT INTO clients (name, age, gender, height_cm, weight_kg, "
+                "goal, membership_status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'Active', ?)",
                 (
-                    name,
-                    data.get("age"),
-                    data.get("height"),
-                    data.get("weight"),
+                    name, data.get("age"), data.get("gender"),
+                    data.get("height_cm"), data.get("weight_kg"),
+                    data.get("goal"), now_text(),
                 ),
             )
             db.commit()
-
         except sqlite3.IntegrityError:
-            return jsonify(
-                error=f"client '{name}' already exists"
-            ), 409
+            return error(f"client '{name}' already exists", 409)
+        return jsonify(message=f"client '{name}' created"), 201
 
-        return jsonify(
-            message=f"client '{name}' created"
-        ), 201
-
-    @app.route("/clients", methods=["GET"])
+    @app.get("/clients")
     def list_clients():
-        db = get_db()
+        rows = get_db().execute("SELECT * FROM clients ORDER BY name").fetchall()
+        return jsonify([dict(r) for r in rows]), 200
 
-        rows = db.execute(
-            "SELECT * FROM clients ORDER BY name"
-        ).fetchall()
-
-        return jsonify([dict(row) for row in rows]), 200
-
-    @app.route("/clients/<name>", methods=["GET"])
+    @app.get("/clients/<name>")
     def get_client(name):
-        db = get_db()
-
-        row = db.execute(
-            "SELECT * FROM clients WHERE name = ?",
-            (name,),
-        ).fetchone()
-
+        row = get_db().execute("SELECT * FROM clients WHERE name = ?", (name,)).fetchone()
         if row is None:
-            return jsonify(error="client not found"), 404
-
+            return error("client not found", 404)
         return jsonify(dict(row)), 200
 
-    @app.route("/clients/<name>/bmi", methods=["GET"])
+    @app.get("/clients/<name>/bmi")
     def client_bmi(name):
-        db = get_db()
-
-        row = db.execute(
-            "SELECT height, weight FROM clients WHERE name = ?",
-            (name,),
+        row = get_db().execute(
+            "SELECT height_cm, weight_kg FROM clients WHERE name = ?", (name,)
         ).fetchone()
-
         if row is None:
-            return jsonify(error="client not found"), 404
+            return error("client not found", 404)
+        try:
+            height_cm = float(row["height_cm"])
+            weight_kg = float(row["weight_kg"])
+            bmi = calculate_bmi(weight_kg, height_cm / 100.0)
+        except (TypeError, ValueError):
+            return error("positive height_cm and weight_kg are required", 400)
+        return jsonify(name=name, bmi=bmi, category=bmi_category(bmi)), 200
 
-        if not row["height"] or not row["weight"]:
-            return jsonify(
-                error="height/weight not set for this client"
-            ), 400
+    @app.delete("/clients/<name>")
+    @require_role("admin", "trainer")
+    def delete_client(name):
+        db = get_db()
+        row = db.execute("SELECT id FROM clients WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            return error("client not found", 404)
+        db.execute("DELETE FROM clients WHERE name = ?", (name,))
+        db.commit()
+        return jsonify(message="client deleted"), 200
 
-        bmi = calculate_bmi(
-            row["weight"],
-            row["height"],
-        )
-
-        return jsonify(
-            name=name,
-            bmi=bmi,
-            category=bmi_category(bmi),
-        ), 200
-
-    @app.route("/clients/<name>/program", methods=["POST"])
+    @app.post("/clients/<name>/program")
     def generate_program(name):
         db = get_db()
-
-        row = db.execute(
-            "SELECT name FROM clients WHERE name = ?",
-            (name,),
-        ).fetchone()
-
-        if row is None:
-            return jsonify(error="client not found"), 404
-
+        if db.execute("SELECT name FROM clients WHERE name = ?", (name,)).fetchone() is None:
+            return error("client not found", 404)
         data = request.get_json(silent=True) or {}
-
-        program_type = data.get("program_type")
-
-        if not program_type:
-            program_type = random.choice(
-                list(PROGRAM_TEMPLATES)
-            )
-
+        program_type = data.get("program_type") or "Beginner"
         if program_type not in PROGRAM_TEMPLATES:
-            return jsonify(
-                error=f"unknown program_type '{program_type}'"
-            ), 400
-
-        detail = random.choice(
-            PROGRAM_TEMPLATES[program_type]
-        )
-
+            return error(f"unknown program_type '{program_type}'", 400)
+        detail = PROGRAM_TEMPLATES[program_type][0]
         db.execute(
-            "UPDATE clients SET program = ? WHERE name = ?",
-            (detail, name),
+            "INSERT INTO programs (client_name, program_type, details, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (name, program_type, detail, now_text()),
         )
         db.commit()
+        return jsonify(name=name, program_type=program_type, program=detail), 201
 
-        return jsonify(
-            name=name,
-            program_type=program_type,
-            program=detail,
-        ), 200
-
-    @app.route("/clients/<name>/membership", methods=["GET"])
-    def check_membership(name):
-        db = get_db()
-
-        row = db.execute(
-            """
-            SELECT membership_status
-            FROM clients
-            WHERE name = ?
-            """,
+    @app.get("/clients/<name>/programs")
+    def list_programs(name):
+        rows = get_db().execute(
+            "SELECT program_type, details, created_at FROM programs "
+            "WHERE client_name = ? ORDER BY id DESC",
             (name,),
-        ).fetchone()
+        ).fetchall()
+        if not rows and get_db().execute("SELECT name FROM clients WHERE name = ?", (name,)).fetchone() is None:
+            return error("client not found", 404)
+        return jsonify([dict(r) for r in rows]), 200
 
+    @app.get("/clients/<name>/membership")
+    def membership(name):
+        row = get_db().execute("SELECT membership_status FROM clients WHERE name = ?", (name,)).fetchone()
         if row is None:
-            return jsonify(error="client not found"), 404
+            return error("client not found", 404)
+        return jsonify(name=name, membership_status=row["membership_status"]), 200
 
-        return jsonify(
-            name=name,
-            membership_status=row["membership_status"],
-        ), 200
+    @app.patch("/clients/<name>/membership")
+    @require_role("admin", "trainer")
+    def update_membership(name):
+        data = request.get_json(silent=True) or {}
+        status = data.get("status")
+        if status not in {"Active", "Suspended", "Expired"}:
+            return error("status must be Active, Suspended or Expired", 400)
+        db = get_db()
+        if db.execute("SELECT name FROM clients WHERE name = ?", (name,)).fetchone() is None:
+            return error("client not found", 404)
+        db.execute("UPDATE clients SET membership_status = ? WHERE name = ?", (status, name))
+        db.commit()
+        return jsonify(name=name, membership_status=status), 200
 
-    @app.route("/clients/<name>/workouts", methods=["POST"])
+    @app.get("/exercises")
+    def list_exercises():
+        rows = get_db().execute("SELECT * FROM exercises ORDER BY name").fetchall()
+        return jsonify([dict(r) for r in rows]), 200
+
+    @app.post("/exercises")
+    @require_role("admin", "trainer")
+    def add_exercise():
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        if not name:
+            return error("name is required", 400)
+        try:
+            db = get_db()
+            db.execute(
+                "INSERT INTO exercises (name, muscle_group, equipment) "
+                "VALUES (?, ?, ?)",
+                (name, data.get("muscle_group"), data.get("equipment")),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            return error("exercise already exists", 409)
+        return jsonify(message="exercise created"), 201
+
+    @app.post("/clients/<name>/workouts")
     def add_workout(name):
         db = get_db()
-
-        client = db.execute(
-            "SELECT name FROM clients WHERE name = ?",
-            (name,),
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        data = request.get_json(silent=True) or {}
+        exercise_name = data.get("exercise_name", "General")
+        exercise = db.execute(
+            "SELECT name FROM exercises WHERE name = ?", (exercise_name,)
         ).fetchone()
-
-        if client is None:
-            return jsonify(error="client not found"), 404
-
-        data = request.get_json(force=True) or {}
-
+        if exercise_name != "General" and exercise is None:
+            return error("exercise not found", 404)
         db.execute(
-            """
-            INSERT INTO workouts
-                (client_name, date, workout_type, duration_min, notes)
-            VALUES (?, ?, ?, ?, ?)
-            """,
+            "INSERT INTO workouts (client_name, exercise_name, date, duration_min, "
+            "calories_burned, notes) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                name,
-                data.get("date", date.today().isoformat()),
-                data.get("workout_type", "General"),
-                data.get("duration_min", 30),
+                name, exercise_name, data.get("date", date.today().isoformat()),
+                data.get("duration_min", 30), data.get("calories_burned", 0),
                 data.get("notes", ""),
             ),
         )
-
         db.commit()
-
         return jsonify(message="workout logged"), 201
 
-    @app.route("/clients/<name>/workouts", methods=["GET"])
+    @app.get("/clients/<name>/workouts")
     def list_workouts(name):
         db = get_db()
-
-        client = db.execute(
-            "SELECT name FROM clients WHERE name = ?",
-            (name,),
-        ).fetchone()
-
-        if client is None:
-            return jsonify(error="client not found"), 404
-
+        if not client_exists(db, name):
+            return error("client not found", 404)
         rows = db.execute(
-            """
-            SELECT date, workout_type, duration_min, notes
-            FROM workouts
-            WHERE client_name = ?
-            ORDER BY date DESC
-            """,
+            "SELECT exercise_name, date, duration_min, calories_burned, notes "
+            "FROM workouts WHERE client_name = ? ORDER BY date DESC",
             (name,),
         ).fetchall()
+        return jsonify([dict(r) for r in rows]), 200
 
-        return jsonify([dict(row) for row in rows]), 200
+    @app.post("/clients/<name>/metrics")
+    def add_metrics(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        data = request.get_json(silent=True) or {}
+        db.execute(
+            "INSERT INTO metrics (client_name, recorded_at, weight_kg, body_fat_pct, "
+            "chest_cm, waist_cm, hip_cm, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                name, data.get("recorded_at", date.today().isoformat()),
+                data.get("weight_kg"), data.get("body_fat_pct"),
+                data.get("chest_cm"), data.get("waist_cm"), data.get("hip_cm"),
+                data.get("notes", ""),
+            ),
+        )
+        db.commit()
+        return jsonify(message="metrics recorded"), 201
+
+    @app.get("/clients/<name>/metrics")
+    def list_metrics(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        rows = db.execute(
+            "SELECT recorded_at, weight_kg, body_fat_pct, chest_cm, waist_cm, "
+            "hip_cm, notes FROM metrics WHERE client_name = ? ORDER BY recorded_at DESC",
+            (name,),
+        ).fetchall()
+        return jsonify([dict(r) for r in rows]), 200
+
+    @app.post("/clients/<name>/goals")
+    def add_goal(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        data = request.get_json(silent=True) or {}
+        if not data.get("goal_type"):
+            return error("goal_type is required", 400)
+        db.execute(
+            "INSERT INTO goals (client_name, goal_type, target_value, target_date, status) "
+            "VALUES (?, ?, ?, ?, 'Active')",
+            (name, data["goal_type"], data.get("target_value"), data.get("target_date")),
+        )
+        db.commit()
+        return jsonify(message="goal created"), 201
+
+    @app.get("/clients/<name>/goals")
+    def list_goals(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        rows = db.execute(
+            "SELECT goal_type, target_value, target_date, status FROM goals "
+            "WHERE client_name = ? ORDER BY id DESC",
+            (name,),
+        ).fetchall()
+        return jsonify([dict(r) for r in rows]), 200
+
+    @app.post("/clients/<name>/progress")
+    def add_progress(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        data = request.get_json(silent=True) or {}
+        weight = data.get("weight_kg")
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            return error("positive weight_kg is required", 400)
+        if weight <= 0:
+            return error("positive weight_kg is required", 400)
+        db.execute(
+            "INSERT INTO progress (client_name, recorded_at, weight_kg, note) "
+            "VALUES (?, ?, ?, ?)",
+            (name, data.get("recorded_at", date.today().isoformat()), weight, data.get("note", "")),
+        )
+        db.commit()
+        return jsonify(message="progress recorded"), 201
+
+    @app.get("/clients/<name>/progress")
+    def list_progress(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        rows = db.execute(
+            "SELECT recorded_at, weight_kg, note FROM progress "
+            "WHERE client_name = ? ORDER BY recorded_at",
+            (name,),
+        ).fetchall()
+        return jsonify([dict(r) for r in rows]), 200
+
+    @app.get("/clients/<name>/progress/chart")
+    def progress_chart(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        rows = db.execute(
+            "SELECT recorded_at, weight_kg FROM progress "
+            "WHERE client_name = ? ORDER BY recorded_at",
+            (name,),
+        ).fetchall()
+        response = make_response(svg_progress_chart(rows))
+        response.headers["Content-Type"] = "image/svg+xml"
+        return response
+
+    @app.get("/clients/<name>/calories")
+    def calories(name):
+        row = get_db().execute(
+            "SELECT age, gender, height_cm, weight_kg FROM clients WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return error("client not found", 404)
+        data = request.args
+        try:
+            value = calculate_daily_calories(
+                float(row["weight_kg"]), float(row["height_cm"]),
+                int(row["age"]), row["gender"], data.get("activity", "moderate"),
+            )
+        except (TypeError, ValueError):
+            return error(
+                "client age, gender, height_cm and weight_kg must be valid and "
+                "activity must be specified correctly",
+                400,
+            )
+        return jsonify(name=name, daily_calories=value), 200
+
+    @app.get("/dashboard")
+    @require_role("admin", "trainer")
+    def dashboard():
+        db = get_db()
+        clients = db.execute("SELECT COUNT(*) c FROM clients").fetchone()["c"]
+        active_members = db.execute("SELECT COUNT(*) c FROM clients WHERE membership_status = 'Active'").fetchone()["c"]
+        workouts = db.execute("SELECT COUNT(*) c FROM workouts").fetchone()["c"]
+        progress_updates = db.execute("SELECT COUNT(*) c FROM progress").fetchone()["c"]
+        return jsonify(
+            counts={
+                "clients": clients,
+                "active_members": active_members,
+                "workouts": workouts,
+                "progress_updates": progress_updates,
+            }
+        ), 200
+
+    @app.get("/clients/<name>/summary")
+    def summary(name):
+        db = get_db()
+        client = db.execute("SELECT * FROM clients WHERE name = ?", (name,)).fetchone()
+        if client is None:
+            return error("client not found", 404)
+        workouts = db.execute("SELECT COUNT(*) c FROM workouts WHERE client_name = ?", (name,)).fetchone()["c"]
+        progress = db.execute("SELECT COUNT(*) c FROM progress WHERE client_name = ?", (name,)).fetchone()["c"]
+        metrics = db.execute("SELECT COUNT(*) c FROM metrics WHERE client_name = ?", (name,)).fetchone()["c"]
+        goals = db.execute("SELECT COUNT(*) c FROM goals WHERE client_name = ?", (name,)).fetchone()["c"]
+        return jsonify(
+            client=dict(client),
+            counts={"workouts": workouts, "progress": progress, "metrics": metrics, "goals": goals},
+        ), 200
+
+    @app.get("/analytics/overview")
+    @require_role("admin", "trainer")
+    def analytics_overview():
+        db = get_db()
+        total_clients = db.execute("SELECT COUNT(*) c FROM clients").fetchone()["c"]
+        active = db.execute("SELECT COUNT(*) c FROM clients WHERE membership_status = 'Active'").fetchone()["c"]
+        suspended = db.execute("SELECT COUNT(*) c FROM clients WHERE membership_status = 'Suspended'").fetchone()["c"]
+        expired = db.execute("SELECT COUNT(*) c FROM clients WHERE membership_status = 'Expired'").fetchone()["c"]
+        workouts = db.execute("SELECT COUNT(*) c FROM workouts").fetchone()["c"]
+        avg_weight = db.execute("SELECT AVG(weight_kg) v FROM metrics WHERE weight_kg IS NOT NULL").fetchone()["v"]
+        return jsonify(
+            total_clients=total_clients,
+            memberships={"active": active, "suspended": suspended, "expired": expired},
+            total_workouts=workouts,
+            average_metric_weight=round(avg_weight, 2) if avg_weight is not None else None,
+        ), 200
+
+    @app.get("/clients/<name>/export/csv")
+    def export_csv(name):
+        db = get_db()
+        if not client_exists(db, name):
+            return error("client not found", 404)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["date", "workout_type", "duration_min", "calories_burned", "notes"])
+        rows = db.execute(
+            "SELECT date, exercise_name, duration_min, calories_burned, notes "
+            "FROM workouts WHERE client_name = ? ORDER BY date",
+            (name,),
+        ).fetchall()
+        for row in rows:
+            writer.writerow(list(row))
+        response = make_response(output.getvalue())
+        response.headers["Content-Type"] = "text/csv; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="{name}_workouts.csv"'
+        return response
+
+    @app.get("/clients/<name>/report.pdf")
+    def report_pdf(name):
+        db = get_db()
+        client = db.execute("SELECT * FROM clients WHERE name = ?", (name,)).fetchone()
+        if client is None:
+            return error("client not found", 404)
+        buffer = io.BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        pdf.setTitle(f"ACEest Report - {name}")
+        y = 800
+        pdf.drawString(50, y, "ACEest Fitness & Gym - Client Report")
+        y -= 25
+        pdf.drawString(50, y, f"Client: {name}")
+        y -= 18
+        pdf.drawString(50, y, f"Membership: {client['membership_status']}")
+        y -= 18
+        pdf.drawString(50, y, f"Goal: {client['goal'] or 'Not set'}")
+        y -= 30
+        pdf.drawString(50, y, "Recent Progress")
+        recent_progress = db.execute(
+            "SELECT recorded_at, weight_kg FROM progress WHERE client_name = ? "
+            "ORDER BY recorded_at DESC LIMIT 8",
+            (name,),
+        ).fetchall()
+        for row in recent_progress:
+            y -= 16
+            pdf.drawString(60, y, f"{row['recorded_at']}: {row['weight_kg']} kg")
+        y -= 20
+        pdf.drawString(50, y, "Recent Workouts")
+        recent_workouts = db.execute(
+            "SELECT date, exercise_name, duration_min FROM workouts "
+            "WHERE client_name = ? ORDER BY date DESC LIMIT 8",
+            (name,),
+        ).fetchall()
+        for row in recent_workouts:
+            y -= 16
+            pdf.drawString(60, y, f"{row['date']}: {row['exercise_name']} - {row['duration_min']} min")
+            if y < 80:
+                pdf.showPage()
+                y = 800
+        pdf.save()
+        response = make_response(buffer.getvalue())
+        response.headers["Content-Type"] = "application/pdf"
+        response.headers["Content-Disposition"] = f'attachment; filename="{name}_report.pdf"'
+        return response
 
     init_db()
-
     return app
 
 
 app = create_app()
 
-
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)

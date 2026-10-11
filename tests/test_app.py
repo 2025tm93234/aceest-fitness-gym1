@@ -3,156 +3,210 @@ import tempfile
 
 import pytest
 
-from app import bmi_category, calculate_bmi, create_app
+from app import bmi_category, calculate_bmi, calculate_daily_calories, create_app
 
 
 @pytest.fixture
 def client():
-    db_fd, db_path = tempfile.mkstemp(suffix=".db")
-    app = create_app(db_path=db_path)
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    app = create_app(path)
     app.config["TESTING"] = True
-    with app.test_client() as test_client:
-        yield test_client
-    os.close(db_fd)
-    os.unlink(db_path)
+    with app.test_client() as c:
+        yield c
+    os.unlink(path)
 
 
-def test_health(client):
-    response = client.get("/health")
+def create_client(c, name="Ravi", **kwargs):
+    payload = {"name": name, "age": 28, "gender": "male", "height_cm": 175, "weight_kg": 78, "goal": "Muscle Gain"}
+    payload.update(kwargs)
+    return c.post("/clients", json=payload)
+
+
+def test_health():
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        app = create_app(f.name)
+        app.config["TESTING"] = True
+        assert app.test_client().get("/health").status_code == 200
+
+
+def test_home_version(client):
+    body = client.get("/").get_json()
+    assert body["service"] == "ACEest Fitness & Gym API"
+    assert body["version"] == "1.0"
+
+
+def test_login_success(client):
+    response = client.post("/login", json={"username": "admin", "password": "admin123"})
     assert response.status_code == 200
-    assert response.get_json()["status"] == "ok"
+    assert response.get_json()["role"] == "admin"
+    assert client.post("/logout").status_code == 200
 
 
-def test_home(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "ACEest" in response.get_json()["service"]
+def test_login_bad_password(client):
+    assert client.post("/login", json={"username": "admin", "password": "wrong"}).status_code == 401
 
 
-def test_add_and_get_client(client):
-    response = client.post(
-        "/clients",
-        json={"name": "Ravi", "age": 28, "height": 1.75, "weight": 78},
-    )
-    assert response.status_code == 201
-    response = client.get("/clients/Ravi")
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body["name"] == "Ravi"
-    assert body["membership_status"] == "Active"
+def test_login_missing_fields(client):
+    assert client.post("/login", json={}).status_code == 400
 
 
-def test_list_clients(client):
-    client.post("/clients", json={"name": "Ravi"})
-    client.post("/clients", json={"name": "Meera"})
-    response = client.get("/clients")
-    assert response.status_code == 200
-    assert {row["name"] for row in response.get_json()} == {"Ravi", "Meera"}
+def test_client_create(client):
+    assert create_client(client).status_code == 201
 
 
-def test_duplicate_client_rejected(client):
-    client.post("/clients", json={"name": "Ravi"})
-    response = client.post("/clients", json={"name": "Ravi"})
-    assert response.status_code == 409
+def test_client_list_and_get(client):
+    create_client(client)
+    assert len(client.get("/clients").get_json()) == 1
+    assert client.get("/clients/Ravi").get_json()["name"] == "Ravi"
 
 
-def test_missing_name_rejected(client):
-    response = client.post("/clients", json={"age": 30})
-    assert response.status_code == 400
+def test_duplicate_client(client):
+    create_client(client)
+    assert create_client(client).status_code == 409
 
 
 def test_client_not_found(client):
-    response = client.get("/clients/Nobody")
-    assert response.status_code == 404
+    assert client.get("/clients/Nobody").status_code == 404
 
 
-def test_bmi_calculation(client):
-    client.post("/clients", json={"name": "Meera", "height": 1.60, "weight": 60})
-    response = client.get("/clients/Meera/bmi")
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body["bmi"] == 23.44
-    assert body["category"] == "Normal"
+def test_protected_delete_requires_role(client):
+    create_client(client)
+    assert client.delete("/clients/Ravi").status_code == 403
 
 
-def test_bmi_missing_data(client):
-    client.post("/clients", json={"name": "NoStats"})
-    response = client.get("/clients/NoStats/bmi")
-    assert response.status_code == 400
+def test_client_delete(client):
+    create_client(client)
+    client.post("/login", json={"username": "admin", "password": "admin123"})
+    assert client.delete("/clients/Ravi").status_code == 200
+    assert client.get("/clients/Ravi").status_code == 404
 
 
-def test_bmi_rejects_invalid_height():
-    with pytest.raises(ValueError):
-        calculate_bmi(60, 0)
-
-
-def test_bmi_categories():
+def test_bmi_helpers(client):
+    assert calculate_bmi(60, 1.6) == 23.44
     assert bmi_category(18.4) == "Underweight"
     assert bmi_category(24.9) == "Normal"
     assert bmi_category(29.9) == "Overweight"
-    assert bmi_category(30.0) == "Obese"
+    assert bmi_category(30) == "Obese"
 
-
-def test_generate_program_valid_type(client):
-    client.post("/clients", json={"name": "Arjun"})
-    response = client.post(
-        "/clients/Arjun/program", json={"program_type": "Muscle Gain"}
-    )
+    create_client(client, height_cm=160, weight_kg=60)
+    response = client.get("/clients/Ravi/bmi")
     assert response.status_code == 200
-    body = response.get_json()
-    assert body["program_type"] == "Muscle Gain"
-    assert body["program"]
+    assert response.get_json()["bmi"] == 23.44
+    assert response.get_json()["category"] == "Normal"
+
+    create_client(client, name="NoStats", height_cm=None, weight_kg=None)
+    assert client.get("/clients/NoStats/bmi").status_code == 400
+    assert client.get("/clients/Nobody/bmi").status_code == 404
 
 
-def test_generate_program_invalid_type(client):
-    client.post("/clients", json={"name": "Arjun"})
-    response = client.post(
-        "/clients/Arjun/program", json={"program_type": "Bulk"}
-    )
-    assert response.status_code == 400
+def test_bmi_validation_and_calories(client):
+    create_client(client, height_cm=160, weight_kg=60)
+    assert client.get("/clients/Ravi/calories?activity=moderate").status_code == 200
+    assert client.get("/clients/Ravi/calories?activity=bad").status_code == 400
+    with pytest.raises(ValueError):
+        calculate_daily_calories(60, 160, 30, "x", "moderate")
 
 
-def test_generate_program_unknown_client(client):
-    response = client.post(
-        "/clients/Nobody/program", json={"program_type": "Beginner"}
-    )
-    assert response.status_code == 404
+def test_programs(client):
+    create_client(client)
+    assert client.post("/clients/Ravi/program", json={"program_type": "Muscle Gain"}).status_code == 201
+    assert client.get("/clients/Ravi/programs").get_json()[0]["program_type"] == "Muscle Gain"
+    assert client.post("/clients/Ravi/program", json={"program_type": "Bad"}).status_code == 400
+    assert client.get("/clients/Nobody/programs").status_code == 404
 
 
-def test_membership_check(client):
-    client.post("/clients", json={"name": "Divya"})
-    response = client.get("/clients/Divya/membership")
+def test_membership(client):
+    create_client(client)
+    assert client.get("/clients/Ravi/membership").get_json()["membership_status"] == "Active"
+    assert client.patch("/clients/Ravi/membership", json={"status": "Suspended"}).status_code == 403
+    client.post("/login", json={"username": "trainer", "password": "trainer123"})
+    assert client.patch("/clients/Ravi/membership", json={"status": "Suspended"}).status_code == 200
+    assert client.patch("/clients/Ravi/membership", json={"status": "Bad"}).status_code == 400
+    assert client.get("/clients/Nobody/membership").status_code == 404
+
+
+def test_exercise_create_list_duplicate(client):
+    client.post("/login", json={"username": "trainer", "password": "trainer123"})
+    assert client.post("/exercises", json={"name": "Squat", "muscle_group": "Legs"}).status_code == 201
+    assert client.get("/exercises").get_json()[0]["name"] == "Squat"
+    assert client.post("/exercises", json={"name": "Squat"}).status_code == 409
+
+
+def test_workouts(client):
+    create_client(client)
+    client.post("/login", json={"username": "trainer", "password": "trainer123"})
+    assert client.post("/exercises", json={"name": "Squat"}).status_code == 201
+    client.post("/logout")
+    assert client.post("/clients/Ravi/workouts", json={"exercise_name": "Squat", "duration_min": 45}).status_code == 201
+    assert client.get("/clients/Ravi/workouts").get_json()[0]["exercise_name"] == "Squat"
+    assert client.post("/clients/Ravi/workouts", json={"exercise_name": "Missing"}).status_code == 404
+    assert client.get("/clients/Nobody/workouts").status_code == 404
+
+
+def test_metrics(client):
+    create_client(client)
+    assert client.post("/clients/Ravi/metrics", json={"weight_kg": 78, "body_fat_pct": 20}).status_code == 201
+    assert client.get("/clients/Ravi/metrics").status_code == 200
+    assert client.get("/clients/Nobody/metrics").status_code == 404
+
+
+def test_goals(client):
+    create_client(client)
+    assert client.post("/clients/Ravi/goals", json={}).status_code == 400
+    assert client.post("/clients/Ravi/goals", json={"goal_type": "Weight", "target_value": 70}).status_code == 201
+    assert client.get("/clients/Ravi/goals").get_json()[0]["goal_type"] == "Weight"
+    assert client.get("/clients/Nobody/goals").status_code == 404
+
+
+def test_progress_and_chart(client):
+    create_client(client)
+    assert client.get("/clients/Ravi/progress/chart").status_code == 200
+    assert client.post("/clients/Ravi/progress", json={"weight_kg": 0}).status_code == 400
+    assert client.post("/clients/Ravi/progress", json={"weight_kg": "invalid"}).status_code == 400
+    assert client.post("/clients/Ravi/progress", json={"recorded_at": "2026-01-01", "weight_kg": 78}).status_code == 201
+    assert client.post("/clients/Ravi/progress", json={"recorded_at": "2026-02-01", "weight_kg": 76}).status_code == 201
+    assert len(client.get("/clients/Ravi/progress").get_json()) == 2
+    chart = client.get("/clients/Ravi/progress/chart")
+    assert chart.status_code == 200
+    assert chart.headers["Content-Type"].startswith("image/svg+xml")
+    assert client.get("/clients/Nobody/progress").status_code == 404
+
+
+def test_dashboard(client):
+    assert client.get("/dashboard").status_code == 403
+    client.post("/login", json={"username": "trainer", "password": "trainer123"})
+    assert client.get("/dashboard").status_code == 200
+
+
+def test_summary(client):
+    create_client(client)
+    summary = client.get("/clients/Ravi/summary")
+    assert summary.status_code == 200
+    assert summary.get_json()["counts"]["workouts"] == 0
+    assert client.get("/clients/Nobody/summary").status_code == 404
+
+
+def test_csv_export(client):
+    create_client(client)
+    response = client.get("/clients/Ravi/export/csv")
     assert response.status_code == 200
-    assert response.get_json()["membership_status"] == "Active"
+    assert "text/csv" in response.headers["Content-Type"]
+    assert b"workout_type" in response.data
+    assert client.get("/clients/Nobody/export/csv").status_code == 404
 
 
-def test_add_and_list_workout(client):
-    client.post("/clients", json={"name": "Kabir"})
-    response = client.post(
-        "/clients/Kabir/workouts",
-        json={"date": "2026-01-10", "workout_type": "Cardio", "duration_min": 45},
-    )
-    assert response.status_code == 201
-    response = client.get("/clients/Kabir/workouts")
+def test_pdf_export(client):
+    create_client(client)
+    response = client.get("/clients/Ravi/report.pdf")
     assert response.status_code == 200
-    workouts = response.get_json()
-    assert len(workouts) == 1
-    assert workouts[0]["workout_type"] == "Cardio"
+    assert response.headers["Content-Type"].startswith("application/pdf")
+    assert response.data.startswith(b"%PDF")
+    assert client.get("/clients/Nobody/report.pdf").status_code == 404
 
 
-def test_workout_unknown_client(client):
-    response = client.post(
-        "/clients/Nobody/workouts",
-        json={"workout_type": "Cardio"},
-    )
-    assert response.status_code == 404
-
-
-def test_list_workouts_unknown_client(client):
-    response = client.get("/clients/Nobody/workouts")
-    assert response.status_code == 404
-
-
-def test_membership_check_not_found(client):
-    response = client.get("/clients/Nobody/membership")
-    assert response.status_code == 404
+def test_analytics_overview(client):
+    assert client.get("/analytics/overview").status_code == 403
+    client.post("/login", json={"username": "trainer", "password": "trainer123"})
+    create_client(client)
+    assert client.get("/analytics/overview").status_code == 200
