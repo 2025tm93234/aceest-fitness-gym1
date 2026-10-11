@@ -1,131 +1,77 @@
-
 pipeline {
-
     agent any
 
-
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+        disableConcurrentBuilds()
+    }
 
     triggers {
-
         pollSCM('H/5 * * * *')
-
     }
-
-
 
     environment {
-
-        VENV = "venv"
-
+        IMAGE_NAME = 'aceest-fitness-ci'
     }
-
-
 
     stages {
-
-
-
-        stage('Setup Environment') {
-
+        stage('Clean Checkout') {
             steps {
+                deleteDir()
+                checkout scm
+            }
+        }
 
+        stage('Build & Lint') {
+            steps {
                 sh '''
-
+                    set -eu
                     python3 --version
-
-                    docker --version
-
-
-
-                    python3 -m venv ${VENV}
-
-
-
-                    . ${VENV}/bin/activate
-
-
-
-                    python -m pip install --upgrade pip
-
-                    pip install -r requirements.txt
-
+                    python3 -m venv .venv
+                    . .venv/bin/activate
+                    python -m pip install -r requirements.txt
+                    python -m compileall -q app.py tests
+                    python -m flake8 app.py tests/
+                    python -m pytest -v --cov=app
                 '''
-
             }
-
         }
 
-
-
-        stage('Lint') {
-
+        stage('Docker Image Assembly') {
             steps {
-
-                sh '''
-
-                    . ${VENV}/bin/activate
-
-
-
-                    python -m compileall -q app.py
-
-                    flake8 app.py tests/
-
-                '''
-
+                sh 'docker build --no-cache -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
             }
-
         }
 
-
-
-        stage('Unit Tests') {
-
+        stage('Automated Testing inside Container') {
             steps {
-
-                sh '''
-
-                    . ${VENV}/bin/activate
-
-
-
-                    pytest -v --cov=app
-
-                '''
-
+                sh 'docker run --rm ${IMAGE_NAME}:${BUILD_NUMBER} python -m pytest -v --cov=app'
             }
-
         }
 
-
-
-        stage('Docker Build') {
-
+        stage('Container Health Check') {
             steps {
-
                 sh '''
-
-                    docker build -t aceest-fitness:${BUILD_NUMBER} .
-
+                    set -eu
+                    CONTAINER_NAME="aceest-smoke-${BUILD_NUMBER}"
+                    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    docker run -d --name "$CONTAINER_NAME" "$IMAGE_NAME:$BUILD_NUMBER" >/dev/null
+                    cleanup() {
+                        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
+                    ATTEMPT=0
+                    until docker exec "$CONTAINER_NAME" python -c "from urllib.request import urlopen; print(urlopen('http://127.0.0.1:5000/health', timeout=2).read().decode())"; do
+                        ATTEMPT=$((ATTEMPT + 1))
+                        if [ "$ATTEMPT" -ge 20 ]; then
+                            docker logs "$CONTAINER_NAME"
+                            exit 1
+                        fi
+                        sleep 1
+                    done
                 '''
-
             }
-
         }
-
     }
-
-
-
-    post {
-
-        always {
-
-            echo "Build #${BUILD_NUMBER} finished with status: ${currentBuild.currentResult}"
-
-        }
-
-    }
-
 }
-
